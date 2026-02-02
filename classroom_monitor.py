@@ -1,9 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Classroom Monitor System - Library Version
-- Automatic YouTube Streaming enabled.
-- Includes ThreadedCamera, GmailManager, DriveUploadManager, ClassroomMonitor.
-- Updated to send reports to logged-in Faculty.
+Updated with Robust Camera Handling
 """
 
 import os
@@ -25,8 +23,9 @@ import pickle
 import traceback
 import threading
 from queue import Queue, Empty, Full
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
+import ntplib
 from ultralytics import YOLO
 from insightface.app import FaceAnalysis
 
@@ -47,12 +46,13 @@ from email import encoders
 DEBUG_MODE = True
 
 # --- YOUTUBE STREAM SETTINGS ---
+# Set this to None to force auto-detection, or paste your key URL here
 HARDCODED_RTMP_URL = "rtmp://a.rtmp.youtube.com/live2/yhej-1eyu-2d2v-utgc-e87f"
 
-# --- PATHS (Update these!) ---
-SUSPECT_MODEL_PATH = r"/home/dsplab/Downloads/suspect.pt"
-BEHAVIOR_MODEL_PATH = r"/home/dsplab/Downloads/best.pt"
-DROWSINESS_MODEL_PATH = r"/home/dsplab/Downloads/drowsy.pt"
+# --- PATHS (Ensure these are correct!) ---
+SUSPECT_MODEL_PATH = "suspect.pt"
+BEHAVIOR_MODEL_PATH = "best.pt"
+DROWSINESS_MODEL_PATH = "drowsy.pt"
 
 # --- SETTINGS ---
 EVIDENCE_COOLDOWN_SECONDS = 15  
@@ -63,7 +63,7 @@ CREDENTIALS_FILE = "gdrive5.json"
 TOKEN_PICKLE = "token.pickle"
 GOOGLE_SCOPES = ['https://www.googleapis.com/auth/drive.file', 'https://www.googleapis.com/auth/gmail.send', 'https://www.googleapis.com/auth/youtube.force-ssl']
 DRIVE_FOLDER_NAME = "Classroom_Evidence_Logs" 
-REPORT_RECIPIENT_EMAIL = "cb.en.u4ece22163@cb.students.amrita.edu" # Default fallback
+REPORT_RECIPIENT_EMAIL = "cb.en.u4ece22163@cb.students.amrita.edu" 
 
 # --- THRESHOLDS ---
 CLASS_NAMES = ['listening', 'hand', 'read', 'sleep', 'write']
@@ -88,7 +88,7 @@ COLOR_MAP = {
     'drowsy': (0, 0, 255)
 }
 
-# ================= THREADED CAMERA CLASS =================
+# ================= THREADED CAMERA CLASS (FIXED) =================
 class ThreadedCamera:
     def __init__(self, src=0, use_pi_camera=False):
         self.stop_event = threading.Event()
@@ -100,28 +100,49 @@ class ThreadedCamera:
         self.width = 640
         self.height = 480
 
+        # Method 1: Try Pi Camera GStreamer Pipeline
         if use_pi_camera:
-            print("[CAMERA] Attempting GStreamer pipeline for Pi Camera (libcamerasrc)...")
+            print("[CAMERA] Attempting GStreamer pipeline for Pi Camera...")
             gst_pipeline = "libcamerasrc ! video/x-raw, width=640, height=480, framerate=30/1 ! videoconvert ! video/x-raw, format=BGR ! appsink"
             self.capture = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
-        else:
-            print(f"[CAMERA] Attempting standard V4L2 for Index {src}...")
-            self.capture = cv2.VideoCapture(src, cv2.CAP_V4L2)
-            if not self.capture.isOpened():
-                self.capture = cv2.VideoCapture(src)
+            if self._check_camera():
+                return
 
+        # Method 2: Try specific source index (0, 1, etc.)
+        print(f"[CAMERA] Attempting V4L2/Standard for Index {src}...")
+        self.capture = cv2.VideoCapture(src, cv2.CAP_V4L2)
+        if not self.capture.isOpened():
+            self.capture = cv2.VideoCapture(src)
+        
+        if self._check_camera():
+            return
+
+        # Method 3: Last Resort Auto-Search (0 to 2)
+        print("[CAMERA] Specific index failed. Searching available indices...")
+        for i in range(3):
+            if i == src: continue
+            self.capture = cv2.VideoCapture(i)
+            if self._check_camera():
+                print(f"[CAMERA] Found working camera at Index {i}")
+                return
+        
+        print("[CAMERA FATAL] No working camera found.")
+
+    def _check_camera(self):
+        """Internal helper to verify camera actually returns frames"""
         if self.capture.isOpened():
             self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            self.width = int(self.capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-            self.height = int(self.capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            print(f"[CAMERA] Actual Resolution detected: {self.width}x{self.height}")
-
-            self.status, self.frame = self.capture.read()
-            if self.status: print("[CAMERA] Success! Camera opened.")
-            else: print("[CAMERA] Camera opened but failed to read first frame.")
-        else:
-            print("[CAMERA] Failed to open camera.")
+            # Read a test frame to ensure it's not just "open" but "working"
+            ret, frame = self.capture.read()
+            if ret and frame is not None:
+                self.width = int(self.capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+                self.height = int(self.capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                self.status = True
+                self.frame = frame
+                print(f"[CAMERA] Success! Resolution: {self.width}x{self.height}")
+                return True
+        return False
 
     def start(self, stream_queue):
         self.stream_queue = stream_queue
@@ -140,8 +161,10 @@ class ThreadedCamera:
                     if self.stream_queue is not None:
                         if not self.stream_queue.full():
                             self.stream_queue.put(frame)
-                else: self.stop_event.set()
-            else: time.sleep(0.01)
+                else:
+                    self.stop_event.set()
+            else:
+                time.sleep(0.01)
 
     def read(self):
         with self.lock:
@@ -192,31 +215,12 @@ def setup_youtube_stream(creds):
         print(f"[YOUTUBE ERROR] Setup failed: {e}")
         return None
 
-def ffmpeg_writer(process, frame_queue):
-    while True:
-        try:
-            frame = frame_queue.get()
-            if frame is None: break
-            if process.poll() is not None:
-                print("[FFMPEG WRITER] FFmpeg process has DIED. Stopping stream writer.")
-                break
-            process.stdin.write(frame.tobytes())
-            frame_queue.task_done()
-        except BrokenPipeError:
-            print("[FFMPEG WRITER] Broken Pipe! FFmpeg closed the connection.")
-            break
-        except Exception as e:
-            print(f"[FFMPEG WRITER] Error: {e}")
-            break
-
 def ffmpeg_stderr_reader(process):
     while True:
         line = process.stderr.readline()
         if not line: break
-        try:
-            # print(f"[FFMPEG LOG] {line.decode('utf-8').strip()}") # Uncomment for debugging
-            pass
-        except: pass
+        # print(f"[FFMPEG LOG] {line.decode('utf-8').strip()}") # Debugging
+        pass
 
 # ================= GMAIL & DRIVE MANAGERS =================
 class GmailManager:
@@ -302,11 +306,18 @@ class ClassroomMonitor:
         self.drive_manager = DriveUploadManager(self.creds)
         self.gmail_manager = GmailManager(self.creds)
 
-        print("Loading AI models...")
-        self.behavior_model = YOLO(BEHAVIOR_MODEL_PATH, verbose=False)
-        self.object_model = YOLO('yolov8n.pt', verbose=False) 
-        self.drowsiness_model = YOLO(DROWSINESS_MODEL_PATH, verbose=False)
-        self.suspect_model = YOLO(SUSPECT_MODEL_PATH)
+        print("Loading AI models (This may take a moment)...")
+        # Load models safely
+        try:
+            self.behavior_model = YOLO(BEHAVIOR_MODEL_PATH, verbose=False)
+            self.object_model = YOLO('yolov8n.pt', verbose=False) 
+            self.drowsiness_model = YOLO(DROWSINESS_MODEL_PATH, verbose=False)
+            self.suspect_model = YOLO(SUSPECT_MODEL_PATH)
+        except Exception as e:
+            print(f"[FATAL] Model loading failed: {e}")
+            print("Ensure best.pt, yolov8n.pt, drowsy.pt, suspect.pt are in this folder.")
+            sys.exit(1)
+
         self.awake_classes = ["Awake", "awake_glass", "Normal", "Alert", "awaker"]
         self.drowsy_classes = ["Drowsiness", "Drowsiness -Glasses-", "Drowsiness -SunGlasses-", "Eyes closed", "drowsy"]
         self.face_app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
@@ -320,6 +331,12 @@ class ClassroomMonitor:
         self.is_video_mode = True; self.session_start_time = None; self.session_end_time = None
         self.attendance_log = set(); self.distraction_log = {}
         self.headless_mode = False; self.last_calculated_fps = 0.0
+        self.mobile_usage_authorized = False 
+
+    def set_mobile_policy(self, authorized):
+        self.mobile_usage_authorized = authorized
+        state = "DISABLED" if authorized else "ENABLED"
+        print(f"[POLICY] Mobile Phone Detection is now {state}")
 
     def load_configs(self):
         self.CLASS_NAMES = CLASS_NAMES; self.BEHAVIOR_THRESHOLDS = BEHAVIOR_THRESHOLDS
@@ -400,7 +417,7 @@ class ClassroomMonitor:
             ious = np.array([self.calculate_iou(boxes[current_index], boxes[i]) for i in remaining_indices])
             indices = remaining_indices[ious < iou_threshold]
         return keep_indices
-     
+      
     def update_person_trackers(self, current_detections):
         updated_trackers = {}
         unmatched_det_indices = list(range(len(current_detections)))
@@ -467,13 +484,48 @@ class ClassroomMonitor:
         else: color = self.COLOR_MAP['person_unclaimed']
         return final_label, color
 
+    def get_ist_time(self):
+        try:
+            client = ntplib.NTPClient()
+            response = client.request('pool.ntp.org', version=3, timeout=2)
+            utc_time = datetime.utcfromtimestamp(response.tx_time)
+            ist_time = utc_time + timedelta(hours=5, minutes=30)
+            return ist_time
+        except Exception as e:
+            print(f"⚠️ Warning: Internet time check failed ({e}). Falling back to System Time.")
+            return datetime.now()
+
+    def _format_time(self, seconds):
+        seconds = int(seconds)
+        if seconds < 60: return f"{seconds} sec"
+        elif seconds < 3600:
+            minutes = seconds // 60; secs = seconds % 60
+            return f"{minutes} min {secs} sec"
+        else:
+            hours = seconds // 3600; minutes = (seconds % 3600) // 60; secs = seconds % 60
+            return f"{hours} hr {minutes} min {secs} sec"
+
+    def _adjust_column_widths(self, worksheet):
+        for column in worksheet.columns:
+            max_length = 0
+            column_letter = column[0].column_letter 
+            for cell in column:
+                try:
+                    if cell.value:
+                        cell_length = len(str(cell.value))
+                        if cell_length > max_length: max_length = cell_length
+                except: pass
+            adjusted_width = (max_length + 2) 
+            worksheet.column_dimensions[column_letter].width = adjusted_width
+
     def start_session(self):
-        self.session_start_time = datetime.now(); self.attendance_log = set(); self.distraction_log = {}
-        print(f"Monitoring session started at {self.session_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        self.session_start_time = self.get_ist_time()
+        self.attendance_log = set(); self.distraction_log = {}
+        print(f"Monitoring session started at {self.session_start_time.strftime('%Y-%m-%d %H:%M:%S')} (IST)")
 
     def end_session(self):
-        self.session_end_time = datetime.now()
-        print(f"Monitoring session ended at {self.session_end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        self.session_end_time = self.get_ist_time()
+        print(f"Monitoring session ended at {self.session_end_time.strftime('%Y-%m-%d %H:%M:%S')} (IST)")
         self.drive_manager.stop() 
 
     def update_logs(self, delta_time):
@@ -492,39 +544,76 @@ class ClassroomMonitor:
                             if time.time() - self.sleep_timers[tracker_id] < self.SLEEP_DELAY_SECONDS: continue
                     if distraction in self.distraction_log[name]: self.distraction_log[name][distraction] += delta_time
 
-    def _format_time(self, seconds): return f"{int(seconds // 60)} min {int(seconds % 60)} sec"
-
-    # --- MODIFIED: ACCEPT RECIPIENT_EMAIL ARGUMENT ---
     def generate_reports(self, recipient_email=None):
-        if not self.session_start_time or not self.session_end_time: return
+        if not self.session_start_time or not self.session_end_time:
+            print("No session data to generate reports.")
+            return
+
         print("\nGenerating reports... Please wait.")
-        
-        # Use the passed email if available, otherwise use default
         target_email = recipient_email if recipient_email else REPORT_RECIPIENT_EMAIL
-        
         timestamp = self.session_start_time.strftime("%Y-%m-%d_%H-%M-%S")
-        duration = (self.session_end_time - self.session_start_time).total_seconds()
-        info_df = pd.DataFrame({'Parameter': ['Start', 'End', 'Duration (s)'], 'Value': [self.session_start_time, self.session_end_time, round(duration, 2)]})
-        files_to_email = []; all_students = sorted(self.known_face_names)
-        if all_students:
-            att_data = [{'Student': n, 'Status': 'Present' if n in self.attendance_log else 'Absent'} for n in all_students]
-            att_file = f"Attendance_{timestamp}.xlsx"
-            with pd.ExcelWriter(att_file, engine='openpyxl') as writer:
-                info_df.to_excel(writer, sheet_name='Report', index=False)
-                pd.DataFrame(att_data).to_excel(writer, sheet_name='Report', index=False, startrow=5)
-            files_to_email.append(att_file)
-        dist_data = []
-        for name, d in self.distraction_log.items():
-            if any(v > 0 for v in d.values()):
-                dist_data.append({'Student': name, 'Mobile': self._format_time(d['Using Mobile']), 'Suspect': self._format_time(d['Mobile Suspect']), 'Sleep': self._format_time(d['Sleeping'])})
-        if dist_data:
-            dist_file = f"Distraction_{timestamp}.xlsx"
-            with pd.ExcelWriter(dist_file, engine='openpyxl') as writer:
-                info_df.to_excel(writer, sheet_name='Report', index=False)
-                pd.DataFrame(dist_data).to_excel(writer, sheet_name='Report', index=False, startrow=5)
-            files_to_email.append(dist_file)
+        session_duration = (self.session_end_time - self.session_start_time).total_seconds()
         
-        # Send to the dynamic target email
+        session_info_df = pd.DataFrame({
+            'Parameter': ['Session Start Time', 'Session End Time', 'Total Duration'],
+            'Value': [
+                self.session_start_time.strftime("%Y-%m-%d %H:%M:%S") + " IST",
+                self.session_end_time.strftime("%Y-%m-%d %H:%M:%S") + " IST",
+                self._format_time(session_duration)
+            ]
+        })
+
+        files_to_email = [] 
+
+        # --- Attendance Report ---
+        attendance_filename = f"Attendance_Report_{timestamp}.xlsx"
+        all_students = sorted(self.known_face_names)
+        
+        if not all_students:
+            print("No students found in the face database. Skipping attendance report.")
+        else:
+            attendance_data = []
+            for name in all_students:
+                status = "Present" if name in self.attendance_log else "Absent"
+                attendance_data.append({'Student Name': name, 'Status': status})
+            
+            attendance_df = pd.DataFrame(attendance_data)
+            with pd.ExcelWriter(attendance_filename, engine='openpyxl') as writer:
+                session_info_df.to_excel(writer, sheet_name='Report', index=False, startrow=0)
+                attendance_df.to_excel(writer, sheet_name='Report', index=False, startrow=len(session_info_df)+2, header=['Student Name', 'Status'])
+                self._adjust_column_widths(writer.sheets['Report'])
+
+            print(f"✅ Full attendance report saved to {attendance_filename}")
+            files_to_email.append(attendance_filename) 
+
+        # --- Distraction Report ---
+        distraction_filename = f"Distraction_Report_{timestamp}.xlsx"
+        distraction_data = []
+        
+        for name, durations in self.distraction_log.items():
+            s_time = durations.get('Sleeping', 0)
+            m_using_time = durations.get('Using Mobile', 0)
+            m_suspect_time = durations.get('Mobile Suspect', 0)
+
+            if s_time > 0 or m_using_time > 0 or m_suspect_time > 0:
+                distraction_data.append({
+                    'Student Name': name,
+                    'Using Mobile': self._format_time(m_using_time),
+                    'Mobile Suspect': self._format_time(m_suspect_time),
+                    'Sleeping': self._format_time(s_time)
+                })
+        
+        if not distraction_data:
+            print("No distractions recorded. Distraction report not generated.")
+        else:
+            distraction_df = pd.DataFrame(distraction_data)
+            with pd.ExcelWriter(distraction_filename, engine='openpyxl') as writer:
+                distraction_df.to_excel(writer, sheet_name='Report', index=False, startrow=0)
+                self._adjust_column_widths(writer.sheets['Report'])
+
+            print(f"✅ Distraction report saved to {distraction_filename}")
+            files_to_email.append(distraction_filename) 
+
         if files_to_email:
             self.gmail_manager.send_email_with_attachments(target_email, f"Classroom Reports - {timestamp}", "Attached are the session reports.", files_to_email)
             print(f"Reports sent successfully to {target_email}.")
@@ -546,11 +635,16 @@ class ClassroomMonitor:
         try:
             frame_prep = self.preprocess_frame(frame)
             person_res = self.object_model(frame_prep, classes=[self.PERSON_CLASS_ID], conf=0.6, verbose=False, iou=0.5, agnostic_nms=True, device='cpu')
-            phone_res = self.object_model(frame_prep, classes=[self.CELL_PHONE_CLASS_ID], conf=0.25, verbose=False, iou=0.5, agnostic_nms=True, device='cpu')
             behav_res = self.behavior_model(frame_prep, conf=0.1, verbose=False, iou=0.5, agnostic_nms=True, device='cpu')
             drowsy_res = self.drowsiness_model(frame_prep, conf=0.4, verbose=False, iou=0.5, agnostic_nms=True, device='cpu')
-            suspect_res = self.suspect_model(frame_prep, conf=self.SUSPECT_MIN_CONF, verbose=False, iou=0.5, agnostic_nms=True, device='cpu') 
             insight_faces = self.face_app.get(frame_prep)
+            
+            phone_res = []
+            suspect_res = []
+            
+            if not self.mobile_usage_authorized:
+                phone_res = self.object_model(frame_prep, classes=[self.CELL_PHONE_CLASS_ID], conf=0.25, verbose=False, iou=0.5, agnostic_nms=True, device='cpu')
+                suspect_res = self.suspect_model(frame_prep, conf=self.SUSPECT_MIN_CONF, verbose=False, iou=0.5, agnostic_nms=True, device='cpu')
             
             raw_boxes = [list(map(int, box.xyxy[0])) for r in person_res for box in r.boxes]
             raw_scores = [float(box.conf[0]) for r in person_res for box in r.boxes]
@@ -654,85 +748,5 @@ class ClassroomMonitor:
             return annotated_frame
         except Exception: traceback.print_exc(); return frame
 
-# ================= MAIN EXECUTION =================
-running = True
-def signal_handler(sig, frame): global running; print("\n[INFO] Exiting requested..."); running = False
-signal.signal(signal.SIGINT, signal_handler)
-
 if __name__ == "__main__":
-    try:
-        monitor = ClassroomMonitor()
-        while running:
-            print("\n--- Classroom Monitor Menu ---\n1. Run from Camera\n2. Add New Face\n3. Exit")
-            choice = input("Enter your choice: ")
-            if choice == '1':
-                monitor.is_video_mode = True
-                
-                # --- AUTOMATICALLY ENABLE YOUTUBE STREAMING ---
-                use_youtube = True 
-                
-                cam_index = 0; use_pi_cam = False; rtmp_url = None; ffmpeg_process = None; frame_queue = None
-                
-                # --- STEP 1: OPEN CAMERA FIRST ---
-                camera = ThreadedCamera(src=cam_index, use_pi_camera=use_pi_cam)
-                if not camera.status:
-                    print("[ERROR] Could not open camera. Exiting to menu..."); camera.release(); continue
-
-                # --- STEP 2: SETUP FFmpeg ---
-                if use_youtube:
-                    rtmp_url = setup_youtube_stream(monitor.creds)
-                    if rtmp_url:
-                        print(f"[YOUTUBE] Streaming to: {rtmp_url}")
-                        print(f"[YOUTUBE] Using Input Resolution: {camera.width}x{camera.height}")
-                        cmd = ['ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo', '-pix_fmt', 'bgr24', '-s', f'{camera.width}x{camera.height}', '-r', '30', '-i', '-', '-f', 'lavfi', '-i', 'anullsrc', '-c:a', 'aac', '-ar', '44100', '-b:a', '128k', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'ultrafast', '-g', '60', '-b:v', '2000k', '-maxrate', '2000k', '-bufsize', '4000k', '-f', 'flv', rtmp_url]
-                        ffmpeg_process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-                        frame_queue = Queue(maxsize=30)
-                        threading.Thread(target=ffmpeg_writer, args=(ffmpeg_process, frame_queue), daemon=True).start()
-                        threading.Thread(target=ffmpeg_stderr_reader, args=(ffmpeg_process,), daemon=True).start()
-                    else:
-                        print("[YOUTUBE ERROR] Could not get valid RTMP URL. Streaming DISABLED.")
-                
-                # --- STEP 3: START CAMERA STREAMING ---
-                camera.start(frame_queue)
-                monitor.start_session()
-                session_running = True 
-                
-                try:
-                    while session_running and running:
-                        status, frame = camera.read()
-                        if not status or frame is None: break
-                        processed = monitor.detect_behaviors(frame)
-                        
-                        if not monitor.headless_mode:
-                            try:
-                                cv2.imshow("Classroom Monitor", processed)
-                                if cv2.waitKey(1) & 0xFF == ord('q'): 
-                                    print("\n[INFO] 'q' pressed. Stopping session...")
-                                    session_running = False 
-                            except cv2.error:
-                                print("\n[WARNING] OpenCV Display failed. Switching to HEADLESS MODE.")
-                                monitor.headless_mode = True
-                except KeyboardInterrupt: 
-                    print("\n[INFO] Stopped by User.")
-                    session_running = False
-                finally:
-                    camera.release()
-                    try:
-                        cv2.destroyAllWindows()
-                        cv2.waitKey(1) 
-                    except Exception: pass
-                    
-                    monitor.end_session()
-                    monitor.generate_reports()
-                    
-                    if frame_queue: frame_queue.put(None)
-                    if ffmpeg_process: ffmpeg_process.stdin.close(); ffmpeg_process.terminate()
-            
-            elif choice == '2':
-                img_path = input("Enter path to image for new face: ").strip().strip('"').strip("'")
-                if os.path.exists(img_path):
-                    name = input("Enter name: ")
-                    if name: monitor.add_face_from_image(img_path, name)
-            elif choice == '3': break
-            else: print("Invalid choice.")
-    except Exception as e: print(f"Fatal error: {str(e)}"); traceback.print_exc()
+    print("This file is a library. Please run 'app.py' instead.")
